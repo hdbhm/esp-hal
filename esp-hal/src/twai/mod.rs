@@ -1632,7 +1632,7 @@ mod asynch {
 
     pub struct TwaiAsyncState {
         pub tx_waker: AtomicWaker,
-        pub err_waker: AtomicWaker,
+        pub rx_waker: AtomicWaker,
         pub rx_queue: Channel<CriticalSectionRawMutex, Result<EspTwaiFrame, EspTwaiError>, 32>,
     }
 
@@ -1646,7 +1646,7 @@ mod asynch {
         pub const fn new() -> Self {
             Self {
                 tx_waker: AtomicWaker::new(),
-                err_waker: AtomicWaker::new(),
+                rx_waker: AtomicWaker::new(),
                 rx_queue: Channel::new(),
             }
         }
@@ -1746,7 +1746,7 @@ mod asynch {
         pub async fn receive_async(&mut self) -> Result<EspTwaiFrame, EspTwaiError> {
             self.twai.enable_interrupts();
             poll_fn(|cx| {
-                self.twai.async_state().err_waker.register(cx.waker());
+                self.twai.async_state().rx_waker.register(cx.waker());
 
                 if let Poll::Ready(result) = self.twai.async_state().rx_queue.poll_receive(cx) {
                     return Poll::Ready(result);
@@ -1813,29 +1813,37 @@ mod asynch {
                     Err(e) => warn!("Error reading frame: {:?}", e),
                 }
             }
-
-            // We have read all frames from the RX FIFO above, so we can safely
-            // clear the overrun bit here.
-            let status = register_block.status().read();
-            if status.overrun_st().bit_is_set() {
-                register_block.cmd().write(|w| w.clr_overrun().set_bit());
-            }
         }
 
-        if intr_status.bits() & 0b11111100 > 0 {
-            let err_capture = register_block.err_code_cap().read();
-            let status = register_block.status().read();
+        // We have read all frames from the RX FIFO above, so we can safely
+        // clear the overrun now.
+        if intr_status.overrun_int_st().bit_is_set() {
+            register_block.cmd().write(|w| w.clr_overrun().set_bit());
+        }
 
-            // Read error code direction (transmitting or receiving)
-            let ecc_direction = err_capture.ecc_direction().bit_is_set();
+        if intr_status.arb_lost_int_st().bit_is_set() {
+            // Read the arbitration lost capture register in cases were we lost bus
+            // arbitration to another node.
+            // TODO: maybe record stats in async state.
+            let _ = register_block.arb_lost_cap().read().bits();
+        }
 
-            // If the error comes from Tx and Tx request is pending
-            if !ecc_direction && !status.tx_buf_st().bit_is_set() {
-                // Cancel a pending transmission request
+        if intr_status.bits() & 0b10110100 > 0 {
+            // In cases of errors, read out the code capture register so future.
+            // TODO: maybe record error stats in async state.
+            let _ = register_block.err_code_cap().read();
+        }
+
+        let status = register_block.status().read();
+        if status.bus_off_st().bit_is_set() {
+            // Abort running transmissions and wake active transmit and receive
+            // calls if we are in bus-off state. At this point, the user has to
+            // initiate the bus-recovery protocol.
+            if !status.tx_buf_st().bit_is_set() {
                 register_block.cmd().write(|w| w.abort_tx().set_bit());
+                async_state.tx_waker.wake();
             }
-
-            async_state.err_waker.wake();
+            async_state.rx_waker.wake();
         }
 
         // Clear interrupt request bits
