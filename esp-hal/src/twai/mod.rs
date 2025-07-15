@@ -1089,11 +1089,7 @@ where
     /// Note that this may not be the number of valid messages in the receive
     /// FIFO due to fifo overflow/overrun.
     pub fn num_available_messages(&self) -> u8 {
-        self.regs()
-            .rx_message_cnt()
-            .read()
-            .rx_message_counter()
-            .bits()
+        num_available_messages(self.regs())
     }
 
     /// Clear the receive FIFO, discarding any valid, partial, or invalid
@@ -1343,6 +1339,20 @@ pub trait PrivateInstance: crate::private::Sealed {
 
     /// Returns a reference to the asynchronous state for this TWAI instance.
     fn async_state(&self) -> &asynch::TwaiAsyncState;
+}
+
+/// Get the number of messages that the peripheral has available in the
+/// receive FIFO.
+///
+/// Note that this may not be the number of valid messages in the receive
+/// FIFO due to fifo overflow/overrun.
+#[inline(always)]
+fn num_available_messages(register_block: &RegisterBlock) -> u8 {
+    register_block
+        .rx_message_cnt()
+        .read()
+        .rx_message_counter()
+        .bits()
 }
 
 /// Read a frame from the peripheral.
@@ -1781,24 +1791,34 @@ mod asynch {
         }
 
         if rx_int_status.bit_is_set() {
-            let status = register_block.status().read();
+            while num_available_messages(register_block) > 0 {
+                let status = register_block.status().read();
 
-            let rx_queue = &async_state.rx_queue;
+                let rx_queue = &async_state.rx_queue;
 
-            if status.bus_off_st().bit_is_set() {
-                let _ = rx_queue.try_send(Err(EspTwaiError::BusOff));
-            }
+                if status.bus_off_st().bit_is_set() {
+                    let _ = rx_queue.try_send(Err(EspTwaiError::BusOff));
+                }
 
-            if status.miss_st().bit_is_set() {
-                let _ = rx_queue.try_send(Err(EspTwaiError::EmbeddedHAL(ErrorKind::Overrun)));
-                release_receive_fifo(register_block);
-            } else {
+                if status.miss_st().bit_is_set() {
+                    let _ = rx_queue.try_send(Err(EspTwaiError::EmbeddedHAL(ErrorKind::Overrun)));
+                    release_receive_fifo(register_block);
+                    continue;
+                }
+
                 match read_frame(register_block) {
                     Ok(frame) => {
                         let _ = rx_queue.try_send(Ok(frame));
                     }
                     Err(e) => warn!("Error reading frame: {:?}", e),
                 }
+            }
+
+            // We have read all frames from the RX FIFO above, so we can safely
+            // clear the overrun bit here.
+            let status = register_block.status().read();
+            if status.overrun_st().bit_is_set() {
+                register_block.cmd().write(|w| w.clr_overrun().set_bit());
             }
         }
 
